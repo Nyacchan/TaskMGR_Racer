@@ -1,0 +1,1348 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Threading;
+using SSDRacer.Capture;
+using SSDRacer.Game;
+using SSDRacer.Localization;
+using SSDRacer.Overlay;
+using SSDRacer.Taskmgr;
+using Application = System.Windows.Application;
+using Forms = System.Windows.Forms;
+
+namespace SSDRacer.App;
+
+public partial class App : Application
+{
+    /// <summary>单实例互斥体名（会话内唯一，区分多用户）。</summary>
+    private const string InstanceMutexName = @"Local\SSDRacer.SingleInstance.Mutex";
+    /// <summary>“请求旧实例退出”的命名事件。</summary>
+    private const string InstanceShutdownEventName = @"Local\SSDRacer.SingleInstance.Shutdown";
+
+    private NotifyIcon? _tray;
+    private ToolStripMenuItem? _trackItem;
+    private ToolStripMenuItem? _overlayItem;
+    private ToolStripMenuItem? _statusItem;
+    private ToolStripMenuItem? _followExternalItem;
+    private ToolStripMenuItem? _followChildItem;
+    private ToolStripMenuItem? _raceItem;
+    private ToolStripMenuItem? _restartItem;
+    private ToolStripMenuItem? _coinModeItem;
+    private ToolStripMenuItem? _debugItem;
+    private ToolStripMenuItem? _fitItem;
+    private ToolStripMenuItem? _advancedItem;
+    private ToolStripMenuItem? _exitItem;
+    private ToolStripMenuItem? _followMenuItem;
+    private ToolStripMenuItem? _langMenuItem;
+    private ToolStripMenuItem? _langEnItem;
+    private ToolStripMenuItem? _langZhItem;
+    private OverlayWindow? _overlay;
+    private NativeExternalOverlay? _nativeOverlay;
+    private TaskmgrWatcher? _watcher;
+    private bool _debugOverlay;
+    private bool _showFitPolyline;
+    private bool _adminTipShown;
+    private bool _tabWasDown;
+    private TrackFollowMode _followMode = TrackFollowMode.External;
+
+    private readonly ScreenRoiCapture _screenCapture = new();
+    private readonly TaskmgrWindowCapture _windowCapture = new();
+    private readonly HeightFieldExtractor _extractor = new();
+    private readonly RaceSim _race = new();
+    private DispatcherTimer? _captureTimer;
+    private DispatcherTimer? _raceTimer;
+    private int _captureFailStreak;
+    private int _externalFrameFailStreak;
+    private string _capStatus = "";
+    private int _trayTipFrame;
+    private bool _raceWanted;
+    private bool _spaceWasDown;
+    private bool _rollWasDown;
+    private TimeSpan _lastRaceTime;
+    private Mutex? _instanceMutex;
+    private EventWaitHandle? _shutdownSignal;
+    private DispatcherTimer? _instanceWatchTimer;
+
+    protected override void OnStartup(StartupEventArgs e)
+    {
+        // 单实例替换：检测到已有实例时先结束旧进程，再由本进程接管。
+        AcquireSingleInstance();
+
+        Forms.Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+        base.OnStartup(e);
+        Locale.ApplyFromOs();
+        Locale.Changed += OnLocaleChanged;
+        GameInput.Install();
+
+        _overlay = new OverlayWindow
+        {
+            ShowDebugChrome = _debugOverlay,
+            ShowFitPolyline = _showFitPolyline,
+        };
+        _nativeOverlay = new NativeExternalOverlay
+        {
+            ShowDebugChrome = _debugOverlay,
+            ShowFitPolyline = _showFitPolyline,
+        };
+        // Terrain egress only — never run physics inside TickExternalFrame.
+        _overlay.HeightFieldUpdated += OnHeightFieldUpdated;
+        _nativeOverlay.HeightFieldUpdated += OnHeightFieldUpdated;
+
+        _watcher = new TaskmgrWatcher();
+        _watcher.SetFollowMode(_followMode);
+        _watcher.RoiChanged += roi =>
+        {
+            if (Dispatcher.CheckAccess())
+            {
+                OnRoiChanged(roi);
+            }
+            else
+            {
+                Dispatcher.BeginInvoke(() => OnRoiChanged(roi));
+            }
+        };
+
+        // Child capture remains at 30 Hz.
+        _captureTimer = new DispatcherTimer(DispatcherPriority.Render)
+        {
+            Interval = TimeSpan.FromMilliseconds(33),
+        };
+        _captureTimer.Tick += (_, _) => CaptureTickChild();
+
+        // RaceHost owns the single 60 Hz frame loop: External terrain feed
+        // (WGC capture + extract + SetTerrain) then physics then render.
+        _raceTimer = new DispatcherTimer(DispatcherPriority.Render)
+        {
+            Interval = TimeSpan.FromMilliseconds(16),
+        };
+        _raceTimer.Tick += OnRaceHostTick;
+
+        BuildTray();
+
+        MainWindow = new Window
+        {
+            Width = 0,
+            Height = 0,
+            WindowStyle = WindowStyle.None,
+            ShowInTaskbar = false,
+            AllowsTransparency = true,
+            Background = System.Windows.Media.Brushes.Transparent,
+            Opacity = 0,
+        };
+        MainWindow.Show();
+        MainWindow.Hide();
+
+        // Player UX: watch Taskmgr immediately (lunar _watcher.Start on launch).
+        StartTracking();
+
+        // UIPI: non-admin vs elevated Taskmgr — tip once at launch (not only on race start).
+        MaybeWarnNonAdmin();
+    }
+
+    /// <summary>
+    /// 单实例替换：若已有实例在运行，通知其优雅退出（释放键盘钩子/托盘图标），
+    /// 等待互斥体释放后接管；超时或旧版本无响应时强制结束旧进程。
+    /// 本实例随后监听同一事件——再下一次启动时自己会被以同样方式替换。
+    /// </summary>
+    private void AcquireSingleInstance()
+    {
+        _instanceMutex = new Mutex(initiallyOwned: true, InstanceMutexName, out var createdNew);
+
+        if (!createdNew)
+        {
+            SignalExistingInstanceToExit();
+            for (var i = 0; i < 30 && !createdNew; i++)
+            {
+                Thread.Sleep(100);
+                _instanceMutex.Dispose();
+                _instanceMutex = new Mutex(true, InstanceMutexName, out createdNew);
+            }
+
+            if (!createdNew)
+            {
+                // 兜底：旧实例无响应（如旧版本没有此机制）→ 强制结束第一个进程。
+                foreach (var proc in Process.GetProcessesByName("SSDRacer"))
+                {
+                    if (proc.Id != Environment.ProcessId)
+                    {
+                        try
+                        {
+                            proc.Kill();
+                        }
+                        catch
+                        {
+                            // 进程可能刚好已退出
+                        }
+                    }
+
+                    proc.Dispose();
+                }
+
+                Thread.Sleep(200);
+                _instanceMutex.Dispose();
+                _instanceMutex = new Mutex(true, InstanceMutexName, out createdNew);
+            }
+        }
+
+        // 监听“退出请求”：新实例启动时置位本事件 → 本实例优雅退出。
+        if (!EventWaitHandle.TryOpenExisting(InstanceShutdownEventName, out var signal) || signal is null)
+        {
+            signal = new EventWaitHandle(false, EventResetMode.ManualReset, InstanceShutdownEventName);
+        }
+
+        _shutdownSignal = signal;
+        // 自己刚置位过（接管场景）：复位，避免下一 tick 立即误退出。
+        _shutdownSignal.Reset();
+        _instanceWatchTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _instanceWatchTimer.Tick += (_, _) =>
+        {
+            if (_shutdownSignal is not null && _shutdownSignal.WaitOne(0))
+            {
+                Shutdown();
+            }
+        };
+        _instanceWatchTimer.Start();
+    }
+
+    /// <summary>通知已有实例退出（不存在则创建事件并置位，供兜底路径复用）。</summary>
+    private static void SignalExistingInstanceToExit()
+    {
+        try
+        {
+            EventWaitHandle? signal = null;
+            try
+            {
+                if (!EventWaitHandle.TryOpenExisting(InstanceShutdownEventName, out signal))
+                {
+                    signal = new EventWaitHandle(false, EventResetMode.ManualReset, InstanceShutdownEventName);
+                }
+
+                signal.Set();
+            }
+            finally
+            {
+                signal?.Dispose();
+            }
+        }
+        catch
+        {
+            // 通知失败由互斥体等待 + 强杀兜底
+        }
+    }
+
+    private void BuildTray()
+    {
+        var trayIcon = LoadAppIcon() ?? SystemIcons.Application;
+        _tray = new NotifyIcon
+        {
+            Text = Strings.TipOpenCpu,
+            Visible = true,
+            Icon = trayIcon,
+        };
+
+        var menu = new ContextMenuStrip();
+
+        _raceItem = new ToolStripMenuItem();
+        _raceItem.Click += (_, _) => ToggleRace();
+        menu.Items.Add(_raceItem);
+
+        _restartItem = new ToolStripMenuItem { Enabled = false };
+        _restartItem.Click += (_, _) => RestartRace();
+        menu.Items.Add(_restartItem);
+
+        _coinModeItem = new ToolStripMenuItem
+        {
+            CheckOnClick = true,
+            Checked = _race.CoinsEnabled,
+        };
+        _coinModeItem.CheckedChanged += (_, _) =>
+        {
+            if (_coinModeItem is not null)
+            {
+                SetCoinModeEnabled(_coinModeItem.Checked, syncMenu: false);
+            }
+        };
+        menu.Items.Add(_coinModeItem);
+
+        menu.Items.Add(new ToolStripSeparator());
+
+        _advancedItem = new ToolStripMenuItem();
+
+        _trackItem = new ToolStripMenuItem();
+        _trackItem.Click += (_, _) => ToggleTracking();
+        _advancedItem.DropDownItems.Add(_trackItem);
+
+        _followMenuItem = new ToolStripMenuItem();
+        _followExternalItem = new ToolStripMenuItem { CheckOnClick = true };
+        _followChildItem = new ToolStripMenuItem { CheckOnClick = true };
+        _followExternalItem.Click += (_, _) => SetFollowMode(TrackFollowMode.External);
+        _followChildItem.Click += (_, _) => SetFollowMode(TrackFollowMode.Child);
+        _followMenuItem.DropDownItems.Add(_followExternalItem);
+        _followMenuItem.DropDownItems.Add(_followChildItem);
+        _advancedItem.DropDownItems.Add(_followMenuItem);
+        SyncFollowMenu();
+
+        _overlayItem = new ToolStripMenuItem();
+        _overlayItem.Click += (_, _) => ToggleOverlayManual();
+        _advancedItem.DropDownItems.Add(_overlayItem);
+
+        _debugItem = new ToolStripMenuItem { Checked = _debugOverlay, CheckOnClick = true };
+        _debugItem.CheckedChanged += (_, _) =>
+        {
+            if (_debugItem is null)
+            {
+                return;
+            }
+
+            SetDebugChrome(_debugItem.Checked, syncMenu: false);
+        };
+        _advancedItem.DropDownItems.Add(_debugItem);
+
+        _fitItem = new ToolStripMenuItem { Checked = _showFitPolyline, CheckOnClick = true };
+        _fitItem.CheckedChanged += (_, _) =>
+        {
+            if (_fitItem is null)
+            {
+                return;
+            }
+
+            _showFitPolyline = _fitItem.Checked;
+            if (_overlay is not null)
+            {
+                _overlay.ShowFitPolyline = _showFitPolyline;
+            }
+
+            if (_nativeOverlay is not null)
+            {
+                _nativeOverlay.ShowFitPolyline = _showFitPolyline;
+            }
+        };
+        _advancedItem.DropDownItems.Add(_fitItem);
+
+        _langMenuItem = new ToolStripMenuItem();
+        _langEnItem = new ToolStripMenuItem { CheckOnClick = true };
+        _langZhItem = new ToolStripMenuItem { CheckOnClick = true };
+        _langEnItem.Click += (_, _) => Locale.SetEnglish();
+        _langZhItem.Click += (_, _) => Locale.SetChinese();
+        _langMenuItem.DropDownItems.Add(_langEnItem);
+        _langMenuItem.DropDownItems.Add(_langZhItem);
+        _advancedItem.DropDownItems.Add(_langMenuItem);
+
+        _statusItem = new ToolStripMenuItem { Enabled = false };
+        _advancedItem.DropDownItems.Add(_statusItem);
+        menu.Items.Add(_advancedItem);
+        menu.Items.Add(new ToolStripSeparator());
+
+        _exitItem = new ToolStripMenuItem();
+        _exitItem.Click += (_, _) => Shutdown();
+        menu.Items.Add(_exitItem);
+
+        _tray.ContextMenuStrip = menu;
+        _tray.DoubleClick += (_, _) => ToggleRace();
+        ApplyTrayStrings();
+    }
+
+    private void OnLocaleChanged()
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.BeginInvoke(OnLocaleChanged);
+            return;
+        }
+
+        ApplyTrayStrings();
+        RefreshStagePrompts();
+        UpdateTrayTip(_watcher?.CurrentRoi);
+    }
+
+    private void ApplyTrayStrings()
+    {
+        if (_raceItem is not null)
+        {
+            var active = _raceWanted || _race.IsRunning;
+            _raceItem.Text = active ? Strings.TrayStop : Strings.TrayStart;
+        }
+
+        if (_restartItem is not null)
+        {
+            _restartItem.Text = Strings.TrayRestart;
+        }
+
+        SyncCoinModeMenu();
+
+        if (_advancedItem is not null)
+        {
+            _advancedItem.Text = Strings.TrayAdvanced;
+        }
+
+        if (_trackItem is not null)
+        {
+            _trackItem.Text = _watcher?.IsTracking == true
+                ? Strings.TrayPauseWatch
+                : Strings.TrayResumeWatch;
+        }
+
+        if (_followMenuItem is not null)
+        {
+            _followMenuItem.Text = Strings.TrayFollowMode;
+        }
+
+        if (_followExternalItem is not null)
+        {
+            _followExternalItem.Text = Strings.TrayFollowExternal;
+        }
+
+        if (_followChildItem is not null)
+        {
+            _followChildItem.Text = Strings.TrayFollowChild;
+        }
+
+        if (_overlayItem is not null)
+        {
+            _overlayItem.Text = _overlay?.ForceVisible == true
+                ? Strings.TrayManualOverlayCancel
+                : Strings.TrayManualOverlay;
+        }
+
+        if (_debugItem is not null)
+        {
+            _debugItem.Text = Strings.TrayDebugChrome;
+        }
+
+        if (_fitItem is not null)
+        {
+            _fitItem.Text = Strings.TrayDebugFit;
+        }
+
+        if (_langMenuItem is not null)
+        {
+            _langMenuItem.Text = Strings.TrayLanguage;
+        }
+
+        if (_langEnItem is not null)
+        {
+            _langEnItem.Text = Strings.TrayLanguageEn;
+            _langEnItem.Checked = !Locale.IsChinese;
+        }
+
+        if (_langZhItem is not null)
+        {
+            _langZhItem.Text = Strings.TrayLanguageZh;
+            _langZhItem.Checked = Locale.IsChinese;
+        }
+
+        if (_exitItem is not null)
+        {
+            _exitItem.Text = Strings.TrayExit;
+        }
+
+        SyncRaceMenu();
+    }
+
+    private void SetCenterPrompt(string? expanded)
+    {
+        if (_nativeOverlay is not null)
+        {
+            _nativeOverlay.CenterPrompt = expanded;
+        }
+
+        if (_overlay is not null)
+        {
+            _overlay.CenterPrompt = expanded;
+        }
+    }
+
+    private void ClearPlayerBanners()
+    {
+        if (_nativeOverlay is not null)
+        {
+            _nativeOverlay.PlayerBanner = null;
+        }
+
+        if (_overlay is not null)
+        {
+            _overlay.PlayerBanner = null;
+        }
+    }
+
+    private void RefreshStagePrompts()
+    {
+        if (_race.IsDead)
+        {
+            SetCenterPrompt(FormatGameOverPrompt());
+            ClearPlayerBanners();
+            return;
+        }
+
+        if (_raceWanted || _race.IsRunning)
+        {
+            SetCenterPrompt(null);
+            return;
+        }
+
+        UpdateIdleBanners();
+    }
+
+    private string FormatGameOverPrompt()
+    {
+        var reason = _race.DeathReason;
+        var template = _race.CoinsEnabled
+            ? string.IsNullOrEmpty(reason)
+                ? Strings.PromptGameOver
+                : Strings.PromptGameOverWithReason
+            : string.IsNullOrEmpty(reason)
+                ? Strings.PromptGameOverNoCoins
+                : Strings.PromptGameOverNoCoinsWithReason;
+
+        return FigglePrompt.FormatExpand(
+            template,
+            _race.DistanceMeters,
+            _race.BestDistanceMeters,
+            _race.CoinsCollected,
+            reason);
+    }
+
+    /// <summary>Child-only capture path (External uses TickExternalFrame).</summary>
+    private void CaptureTickChild()
+    {
+        if (_overlay is null || _watcher is null || !_watcher.IsTracking)
+        {
+            return;
+        }
+
+        if (_followMode != TrackFollowMode.Child)
+        {
+            return;
+        }
+
+        var roi = _watcher.CurrentRoi;
+        if (roi is null || !roi.Value.ShouldShow)
+        {
+            _captureFailStreak = 0;
+            _capStatus = "cap=sleep";
+            _overlay.SetHeightField(null, _capStatus);
+            UpdateTrayTip(roi);
+            return;
+        }
+
+        var frame = _screenCapture.TryCapture(roi.Value);
+
+        if (frame is null)
+        {
+            _captureFailStreak++;
+            _capStatus = $"cap=fail({_captureFailStreak})";
+            if (_captureFailStreak < 3)
+            {
+                _overlay.SetCaptureStatus(_capStatus);
+            }
+            else
+            {
+                _overlay.SetHeightField(null, _capStatus);
+            }
+
+            UpdateTrayTip(roi);
+            return;
+        }
+
+        _captureFailStreak = 0;
+        var field = _extractor.Extract(frame);
+        if (field is null)
+        {
+            _capStatus = $"cap={_screenCapture.Name}-ok extract=skip";
+            _overlay.SetCaptureStatus(_capStatus);
+        }
+        else
+        {
+            _capStatus = $"cap={_screenCapture.Name}-ok cols={field.PlotWidth}";
+            _overlay.SetHeightField(field, _capStatus);
+        }
+
+        UpdateTrayTip(roi);
+    }
+
+    /// <summary>
+    /// External 模式的地形进给：WGC 读最新帧 + 提取 + SetTerrain + 窗口放置。
+    /// 合并进 RaceHost 帧循环后，与物理、渲染同帧执行，消除跨定时器错位。
+    /// </summary>
+    private void TickExternalFrameSafe()
+    {
+        if (_nativeOverlay is null || _watcher is null || !_watcher.IsTracking)
+        {
+            return;
+        }
+
+        if (_followMode != TrackFollowMode.External)
+        {
+            return;
+        }
+
+        try
+        {
+            _nativeOverlay.TickExternalFrame(_windowCapture, _extractor);
+            _externalFrameFailStreak = 0;
+        }
+        catch (Exception ex)
+        {
+            // One transient placement/drawing failure must not stop the frame
+            // loop. Keep the previous native frame and retry on the next tick.
+            _externalFrameFailStreak++;
+            if (_externalFrameFailStreak == 1 || _externalFrameFailStreak % 60 == 0)
+            {
+                Debug.WriteLine(
+                    $"External overlay frame failed ({_externalFrameFailStreak}): {ex}");
+            }
+        }
+
+        // Throttle tray text updates; NotifyIcon churn every frame is expensive.
+        if ((++_trayTipFrame & 15) == 0)
+        {
+            UpdateTrayTip(_watcher.CurrentRoi);
+        }
+    }
+
+    private void OnHeightFieldUpdated(HeightField field)
+    {
+        if (!_raceWanted && !_race.IsRunning && !_race.IsDead)
+        {
+            return;
+        }
+
+        _race.SetTerrain(field);
+        if (_raceWanted && !_race.IsRunning && !_race.IsDead)
+        {
+            _race.Start();
+            SyncRaceMenu();
+        }
+    }
+
+    /// <summary>
+    /// Bypass clock: physics + SetCarPose only. Must not mutate tray/menu every frame.
+    /// </summary>
+    private void OnRaceHostTick(object? sender, EventArgs e)
+    {
+        PollDebugToggle();
+        TickExternalFrameSafe();
+
+        // 跳变前馈：用捕获层学习的更新周期/相位，预测下次更新时刻喂给 RaceSim。
+        if (_followMode == TrackFollowMode.External && _windowCapture.HasUpdateTiming)
+        {
+            _race.SetPredictedUpdate(_windowCapture.NextUpdateTime);
+        }
+        else
+        {
+            _race.ClearPrediction();
+        }
+
+        if (!_raceWanted && !_race.IsRunning && !_race.IsDead)
+        {
+            UpdateIdleBanners();
+            var idleSpace = GameInput.RestartPressed;
+            if (idleSpace && !_spaceWasDown)
+            {
+                TryHotkeyStartRace();
+            }
+
+            _spaceWasDown = idleSpace;
+            RenderExternalNow();
+            return;
+        }
+
+        if (_race.IsDead && !_race.IsRunning)
+        {
+            SetCenterPrompt(FormatGameOverPrompt());
+            ClearPlayerBanners();
+            var deadSpace = GameInput.RestartPressed;
+            if (deadSpace && !_spaceWasDown)
+            {
+                RestartRace();
+            }
+
+            _spaceWasDown = deadSpace;
+
+            var deadCar = _race.GetCarState();
+            if (_followMode == TrackFollowMode.External)
+            {
+                _nativeOverlay?.SetCarPose(deadCar);
+            }
+            else
+            {
+                _overlay?.SetCarPose(deadCar);
+            }
+
+            RenderExternalNow();
+            return;
+        }
+
+        SetCenterPrompt(null);
+
+        var now = TimeSpan.FromTicks(DateTime.UtcNow.Ticks);
+        if (_lastRaceTime == TimeSpan.Zero)
+        {
+            _lastRaceTime = now;
+        }
+
+        var dt = (now - _lastRaceTime).TotalSeconds;
+        _lastRaceTime = now;
+        if (dt <= 0 || dt > 0.25)
+        {
+            dt = 1.0 / 60.0;
+        }
+
+        var space = GameInput.RestartPressed;
+        if (space && !_spaceWasDown)
+        {
+            RestartRace();
+        }
+
+        _spaceWasDown = space;
+
+        // 翻车回正：翻倒超过惩罚时间后按 R 原地回正（RaceSim 内部检查就绪态）。
+        var roll = GameInput.RollResetDown;
+        if (roll && !_rollWasDown)
+        {
+            _race.TryFlipRecover();
+        }
+
+        _rollWasDown = roll;
+
+        var wasRunning = _race.IsRunning;
+        var throttle = GameInput.ThrottleDown;
+        var brake = GameInput.BrakeDown;
+        if (_race.IsRunning)
+        {
+            _race.SetInput(throttle, brake);
+            _race.Step(dt);
+        }
+
+        var car = _race.GetCarState();
+        if (_followMode == TrackFollowMode.External)
+        {
+            if (_nativeOverlay is not null)
+            {
+                _nativeOverlay.PlayerBanner = null;
+                _nativeOverlay.SetCarPose(car);
+            }
+        }
+        else if (_overlay is not null)
+        {
+            _overlay.PlayerBanner = null;
+            _overlay.SetCarPose(car);
+        }
+
+        // Edge-only menu sync (e.g. running → dead). Never every-frame SyncRaceMenu.
+        if (wasRunning != _race.IsRunning)
+        {
+            SyncRaceMenu();
+        }
+
+        RenderExternalNow();
+    }
+
+    /// <summary>External 模式：物理步进/提示更新后立即用最新地形重绘，保证画面配对。</summary>
+    private void RenderExternalNow()
+    {
+        if (_followMode == TrackFollowMode.External)
+        {
+            _nativeOverlay?.RenderNow();
+        }
+    }
+
+    private void PollDebugToggle()
+    {
+        var tab = GameInput.DebugToggleDown;
+        if (tab && !_tabWasDown)
+        {
+            SetDebugChrome(!_debugOverlay, syncMenu: true);
+        }
+
+        _tabWasDown = tab;
+    }
+
+    private void SetDebugChrome(bool on, bool syncMenu)
+    {
+        _debugOverlay = on;
+        if (_overlay is not null)
+        {
+            _overlay.ShowDebugChrome = on;
+        }
+
+        if (_nativeOverlay is not null)
+        {
+            _nativeOverlay.ShowDebugChrome = on;
+        }
+
+        if (syncMenu && _debugItem is not null && _debugItem.Checked != on)
+        {
+            _debugItem.Checked = on;
+        }
+    }
+
+    private void SetCoinModeEnabled(bool enabled, bool syncMenu)
+    {
+        _race.SetCoinModeEnabled(enabled);
+        if (syncMenu && _coinModeItem is not null && _coinModeItem.Checked != enabled)
+        {
+            _coinModeItem.Checked = enabled;
+        }
+
+        SyncCoinModeMenu();
+        RefreshStagePrompts();
+    }
+
+    private void SyncCoinModeMenu()
+    {
+        if (_coinModeItem is null)
+        {
+            return;
+        }
+
+        _coinModeItem.Text = _race.CoinsEnabled
+            ? Strings.TrayCoinModeOn
+            : Strings.TrayCoinModeOff;
+        if (_coinModeItem.Checked != _race.CoinsEnabled)
+        {
+            _coinModeItem.Checked = _race.CoinsEnabled;
+        }
+    }
+
+    private void UpdateIdleBanners()
+    {
+        if (_watcher?.IsTracking != true)
+        {
+            ClearBanners();
+            return;
+        }
+
+        var field = _followMode == TrackFollowMode.External
+            ? _nativeOverlay?.CurrentHeightField
+            : _overlay?.CurrentHeightField;
+        var roi = _watcher.CurrentRoi;
+
+        string tip;
+        if (_capStatus.StartsWith("cap=fail", StringComparison.Ordinal)
+            || _capStatus.StartsWith("cap=ext-fail", StringComparison.Ordinal))
+        {
+            tip = Strings.PromptCaptureFail;
+        }
+        else if (roi is null || field is null)
+        {
+            tip = Strings.PromptWaitingChart;
+        }
+        else
+        {
+            tip = Strings.PromptIdle;
+        }
+
+        ClearPlayerBanners();
+        SetCenterPrompt(FigglePrompt.Expand(tip));
+        if (_followMode == TrackFollowMode.External)
+        {
+            _nativeOverlay?.SetCarPose(null);
+        }
+        else
+        {
+            _overlay?.SetCarPose(null);
+        }
+    }
+
+    private void ClearBanners()
+    {
+        ClearPlayerBanners();
+        SetCenterPrompt(null);
+    }
+
+    private void SyncPipelineClocks()
+    {
+        if (_watcher?.IsTracking != true)
+        {
+            StopRaceHostLoop();
+            _captureTimer?.Stop();
+            return;
+        }
+
+        // External 地形进给已并入 RaceHost 帧循环；Child 捕获保持独立 30Hz。
+        if (_followMode == TrackFollowMode.External)
+        {
+            _captureTimer?.Stop();
+        }
+        else
+        {
+            _captureTimer?.Start();
+        }
+
+        SyncRaceHostLoop();
+    }
+
+    private void SyncRaceHostLoop()
+    {
+        // Keep host alive while tracking so idle Play banners / Tab toggle work.
+        var need = _raceWanted || _race.IsRunning || _race.IsDead || _watcher?.IsTracking == true;
+        if (need)
+        {
+            StartRaceHostLoop();
+        }
+        else
+        {
+            StopRaceHostLoop();
+            ClearBanners();
+        }
+    }
+
+    private void StartRaceHostLoop()
+    {
+        if (_raceTimer is null || _raceTimer.IsEnabled)
+        {
+            return;
+        }
+
+        _lastRaceTime = TimeSpan.Zero;
+        _raceTimer.Start();
+    }
+
+    private void StopRaceHostLoop()
+    {
+        _raceTimer?.Stop();
+    }
+
+    private void ToggleRace()
+    {
+        if (_raceWanted || _race.IsRunning)
+        {
+            _raceWanted = false;
+            _race.Stop();
+            _overlay?.SetCarPose(null);
+            _nativeOverlay?.SetCarPose(null);
+            SyncRaceHostLoop();
+            SyncRaceMenu();
+            UpdateTrayTip(_watcher?.CurrentRoi);
+            return;
+        }
+
+        if (_watcher?.IsTracking != true)
+        {
+            Forms.MessageBox.Show(
+                Strings.MsgWatchPaused,
+                "SSDRacer",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        var field = _followMode == TrackFollowMode.External
+            ? _nativeOverlay?.CurrentHeightField
+            : _overlay?.CurrentHeightField;
+        if (field is null)
+        {
+            Forms.MessageBox.Show(
+                Strings.MsgNeedCpuChart,
+                "SSDRacer",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        StartRaceCore(warnAdmin: true);
+    }
+
+    /// <summary>Space while idle: start race without tray click (External is click-through).</summary>
+    private void TryHotkeyStartRace()
+    {
+        if (_watcher?.IsTracking != true)
+        {
+            return;
+        }
+
+        var field = _followMode == TrackFollowMode.External
+            ? _nativeOverlay?.CurrentHeightField
+            : _overlay?.CurrentHeightField;
+        if (field is null)
+        {
+            return;
+        }
+
+        StartRaceCore(warnAdmin: false);
+    }
+
+    private void StartRaceCore(bool warnAdmin)
+    {
+        if (warnAdmin)
+        {
+            MaybeWarnNonAdmin();
+        }
+
+        _raceWanted = true;
+        _lastRaceTime = TimeSpan.Zero;
+        var field = _followMode == TrackFollowMode.External
+            ? _nativeOverlay?.CurrentHeightField
+            : _overlay?.CurrentHeightField;
+        if (field is not null)
+        {
+            _race.SetTerrain(field);
+            _race.Start();
+        }
+
+        SetCenterPrompt(null);
+        SyncRaceHostLoop();
+        SyncRaceMenu();
+        UpdateTrayTip(_watcher?.CurrentRoi);
+    }
+
+    private void MaybeWarnNonAdmin()
+    {
+        if (_adminTipShown || IsUserAnAdmin())
+        {
+            return;
+        }
+
+        _adminTipShown = true;
+        Forms.MessageBox.Show(
+            Strings.MsgAdminUipi,
+            "SSDRacer",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information);
+    }
+
+    private void RestartRace()
+    {
+        if (!_raceWanted && !_race.IsDead && !_race.IsRunning)
+        {
+            return;
+        }
+
+        _raceWanted = true;
+        _lastRaceTime = TimeSpan.Zero;
+        var field = _followMode == TrackFollowMode.External
+            ? _nativeOverlay?.CurrentHeightField
+            : _overlay?.CurrentHeightField;
+        if (field is not null)
+        {
+            _race.SetTerrain(field);
+        }
+
+        _race.Restart();
+        SyncRaceHostLoop();
+        SyncRaceMenu();
+    }
+
+    private void SyncRaceMenu()
+    {
+        if (_raceItem is not null)
+        {
+            var active = _raceWanted || _race.IsRunning;
+            _raceItem.Text = active ? Strings.TrayStop : Strings.TrayStart;
+        }
+
+        if (_restartItem is not null)
+        {
+            _restartItem.Enabled = _raceWanted || _race.IsRunning || _race.IsDead;
+            _restartItem.Text = Strings.TrayRestart;
+        }
+    }
+
+    private void SetFollowMode(TrackFollowMode mode)
+    {
+        if (_followMode == mode)
+        {
+            SyncFollowMenu();
+            return;
+        }
+
+        _followMode = mode;
+        _watcher?.SetFollowMode(mode);
+        if (_watcher?.IsTracking == true)
+        {
+            if (mode == TrackFollowMode.External)
+            {
+                _overlay?.SetCarPose(null);
+                _overlay?.ClearRoi();
+                _nativeOverlay?.ApplyRoi(_watcher.CurrentRoi);
+            }
+            else
+            {
+                _nativeOverlay?.SetCarPose(null);
+                _nativeOverlay?.ClearRoi();
+                _overlay?.ApplyRoi(_watcher.CurrentRoi);
+            }
+        }
+
+        SyncPipelineClocks();
+        SyncFollowMenu();
+        UpdateTrayTip(_watcher?.CurrentRoi);
+    }
+
+    private void SyncFollowMenu()
+    {
+        if (_followExternalItem is not null)
+        {
+            _followExternalItem.Checked = _followMode == TrackFollowMode.External;
+        }
+
+        if (_followChildItem is not null)
+        {
+            _followChildItem.Checked = _followMode == TrackFollowMode.Child;
+        }
+    }
+
+    private void OnRoiChanged(ChartRoi? roi)
+    {
+        if (_followMode == TrackFollowMode.External)
+        {
+            _nativeOverlay?.ApplyRoi(roi);
+        }
+        else
+        {
+            _overlay?.ApplyRoi(roi);
+        }
+
+        UpdateTrayTip(roi);
+    }
+
+    private void UpdateTrayTip(ChartRoi? roi)
+    {
+        if (_tray is null)
+        {
+            return;
+        }
+
+        // Player tip stays short; engineering status only under Advanced.
+        string playerTip;
+        if (_watcher?.IsTracking != true)
+        {
+            playerTip = Strings.TipPausedWatch;
+        }
+        else if (_race.IsRunning)
+        {
+            playerTip = Strings.TipRacing;
+        }
+        else if (_race.IsDead)
+        {
+            playerTip = Strings.TipGameOver;
+        }
+        else if (roi is null)
+        {
+            playerTip = Strings.TipOpenCpu;
+        }
+        else
+        {
+            playerTip = Strings.TipSpaceStart;
+        }
+
+        _tray.Text = playerTip.Length <= 63 ? playerTip : playerTip[..63];
+
+        if (_statusItem is null || _watcher is null)
+        {
+            return;
+        }
+
+        if (!_watcher.IsTracking)
+        {
+            _statusItem.Text = Strings.TrayStatusPrefix + Strings.TrayStatusPaused;
+            return;
+        }
+
+        var backend = _watcher.UsingNativeTracker ? "native" : "managed";
+        var follow = _followMode == TrackFollowMode.Child ? "child" : "external";
+        var race = _race.IsDead ? "dead" : _race.IsRunning ? "race" : _raceWanted ? "wait" : "idle";
+        if (roi is null)
+        {
+            _statusItem.Text =
+                $"{Strings.TrayStatusPrefix}tracking ({backend}/{follow}, no CPU chart)";
+            return;
+        }
+
+        var show = _followMode == TrackFollowMode.External && _nativeOverlay is not null
+            ? _nativeOverlay.IsVisible
+            : roi.Value.ShouldShow;
+        var cap = _followMode == TrackFollowMode.External && _nativeOverlay is not null
+            ? _nativeOverlay.DiagnosticStatus
+            : _capStatus;
+        _statusItem.Text =
+            $"{Strings.TrayStatusPrefix}{roi.Value.Width}x{roi.Value.Height} ({backend}/{follow}) show={show} {cap} {race}";
+    }
+
+    private void ToggleTracking()
+    {
+        if (_watcher?.IsTracking == true)
+        {
+            StopTracking();
+        }
+        else
+        {
+            StartTracking();
+        }
+    }
+
+    private void StartTracking()
+    {
+        if (_watcher is null
+            || _trackItem is null
+            || _overlay is null
+            || _nativeOverlay is null
+            || _captureTimer is null
+            || _watcher.IsTracking)
+        {
+            return;
+        }
+
+        if (!TrackNativeApi.IsAvailable())
+        {
+            Forms.MessageBox.Show(
+                Strings.MsgTrackNativeMissing,
+                "SSDRacer",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+
+        _watcher.SetFollowMode(_followMode);
+        _watcher.Start();
+        _trackItem.Text = Strings.TrayPauseWatch;
+        _captureFailStreak = 0;
+        _externalFrameFailStreak = 0;
+        _capStatus = "cap=…";
+        if (_followMode == TrackFollowMode.External)
+        {
+            _nativeOverlay.ApplyRoi(_watcher.CurrentRoi);
+        }
+        else
+        {
+            _overlay.ApplyRoi(_watcher.CurrentRoi);
+        }
+
+        SyncPipelineClocks();
+        UpdateTrayTip(_watcher.CurrentRoi);
+    }
+
+    private void StopTracking()
+    {
+        if (_watcher is null
+            || _trackItem is null
+            || _overlay is null
+            || _nativeOverlay is null
+            || _captureTimer is null
+            || !_watcher.IsTracking)
+        {
+            return;
+        }
+
+        _raceWanted = false;
+        _race.Stop();
+        _overlay.SetCarPose(null);
+        _nativeOverlay.SetCarPose(null);
+        StopRaceHostLoop();
+        _captureTimer.Stop();
+        _watcher.Stop();
+        _trackItem.Text = Strings.TrayResumeWatch;
+        _capStatus = "";
+        _captureFailStreak = 0;
+        _externalFrameFailStreak = 0;
+        _overlay.SetHeightField(null);
+        _overlay.ClearRoi();
+        _nativeOverlay.ClearRoi();
+        ClearBanners();
+        SyncRaceMenu();
+        UpdateTrayTip(null);
+    }
+
+    private void ToggleOverlayManual()
+    {
+        if (_overlay is null || _overlayItem is null)
+        {
+            return;
+        }
+
+        if (_overlay.ForceVisible)
+        {
+            _overlay.HidePlaceholder();
+            _overlayItem.Checked = false;
+            _overlayItem.Text = Strings.TrayManualOverlay;
+        }
+        else
+        {
+            _overlay.ShowDebugChrome = _debugOverlay;
+            _overlay.ShowPlaceholder();
+            _overlayItem.Checked = true;
+            _overlayItem.Text = Strings.TrayManualOverlayCancel;
+        }
+    }
+
+    private static Icon? LoadAppIcon()
+    {
+        try
+        {
+            var path = Environment.ProcessPath;
+            if (!string.IsNullOrEmpty(path))
+            {
+                return Icon.ExtractAssociatedIcon(path);
+            }
+        }
+        catch
+        {
+            // fall through
+        }
+
+        return null;
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        Locale.Changed -= OnLocaleChanged;
+        _raceWanted = false;
+        _race.Stop();
+        StopRaceHostLoop();
+        _captureTimer?.Stop();
+        _captureTimer = null;
+        _raceTimer = null;
+
+        // 单实例：停监听并释放互斥体，允许下一个实例接管。
+        _instanceWatchTimer?.Stop();
+        _instanceWatchTimer = null;
+        _shutdownSignal?.Dispose();
+        _shutdownSignal = null;
+        if (_instanceMutex is not null)
+        {
+            try
+            {
+                _instanceMutex.ReleaseMutex();
+            }
+            catch
+            {
+                // 非持有者（异常路径）直接释放句柄
+            }
+
+            _instanceMutex.Dispose();
+            _instanceMutex = null;
+        }
+
+        GameInput.Uninstall();
+        _windowCapture.Dispose();
+
+        _watcher?.Dispose();
+        _watcher = null;
+
+        if (_overlay is not null)
+        {
+            _overlay.HeightFieldUpdated -= OnHeightFieldUpdated;
+            _overlay.Close();
+            _overlay = null;
+        }
+
+        if (_nativeOverlay is not null)
+        {
+            _nativeOverlay.HeightFieldUpdated -= OnHeightFieldUpdated;
+            _nativeOverlay.Dispose();
+            _nativeOverlay = null;
+        }
+
+        if (_tray is not null)
+        {
+            _tray.Visible = false;
+            _tray.Dispose();
+            _tray = null;
+        }
+
+        base.OnExit(e);
+    }
+
+    [DllImport("shell32.dll")]
+    private static extern bool IsUserAnAdmin();
+}

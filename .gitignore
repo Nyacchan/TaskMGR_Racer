@@ -1,0 +1,26 @@
+# 构建产物
+bin/
+obj/
+*.user
+*.suo
+.vs/
+x64/
+Debug/
+Release/
+
+# 二进制
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# 临时与早期试作
+legacy/
+*.py
+*.tar.gz
+
+# 系统
+Thumbs.db
+desktop.ini

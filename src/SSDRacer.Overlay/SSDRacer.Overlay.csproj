@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.20348.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>SSDRacer.Overlay</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SSDRacer.Capture\SSDRacer.Capture.csproj" />
+    <ProjectReference Include="..\SSDRacer.Game\SSDRacer.Game.csproj" />
+    <ProjectReference Include="..\SSDRacer.Taskmgr\SSDRacer.Taskmgr.csproj" />
+    <ProjectReference Include="..\SSDRacer.Native\SSDRacer.Native.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Vortice.Direct2D1" Version="3.8.3" />
+  </ItemGroup>
+
+</Project>
