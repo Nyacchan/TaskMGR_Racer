@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.20348.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>TaskMGR_Racer.Game</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TaskMGR_Racer.Capture\TaskMGR_Racer.Capture.csproj" />
+    <ProjectReference Include="..\TaskMGR_Racer.Native\TaskMGR_Racer.Native.csproj" />
+    <ProjectReference Include="..\TaskMGR_Racer.Localization\TaskMGR_Racer.Localization.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Package id is Box2D.NetStandard; 1.0.4 exposes the legacy Box2DX API. -->
+    <PackageReference Include="Box2D.NetStandard" Version="1.0.4" />
+  </ItemGroup>
+
+</Project>

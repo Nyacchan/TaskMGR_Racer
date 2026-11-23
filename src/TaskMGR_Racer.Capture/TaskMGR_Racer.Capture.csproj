@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.20348.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>TaskMGR_Racer.Capture</RootNamespace>
+    <!-- Supplies System.Drawing.Common for the Windows-only BitBlt bitmap bridge. -->
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TaskMGR_Racer.Taskmgr\TaskMGR_Racer.Taskmgr.csproj" />
+    <ProjectReference Include="..\TaskMGR_Racer.Native\TaskMGR_Racer.Native.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.20348.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>TaskMGR_Racer.Overlay</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TaskMGR_Racer.Capture\TaskMGR_Racer.Capture.csproj" />
+    <ProjectReference Include="..\TaskMGR_Racer.Game\TaskMGR_Racer.Game.csproj" />
+    <ProjectReference Include="..\TaskMGR_Racer.Taskmgr\TaskMGR_Racer.Taskmgr.csproj" />
+    <ProjectReference Include="..\TaskMGR_Racer.Native\TaskMGR_Racer.Native.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Vortice.Direct2D1" Version="3.8.3" />
+  </ItemGroup>
+
+</Project>
